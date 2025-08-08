@@ -1,0 +1,28 @@
+# 빌드된 실행 파일들
+*.exe
+copier
+superfast-copier-*
+build/
+
+# Go 빌드 캐시
+*.test
+*.out
+
+# 로그 파일들
+logs/
+*.log
+
+# 임시 파일들
+*.tmp
+*.temp
+
+# OS 생성 파일들
+.DS_Store
+Thumbs.db
+
+# IDE 설정 (선택사항)
+.vscode/
+.idea/
+
+# 테스트 파일들
+test_*
