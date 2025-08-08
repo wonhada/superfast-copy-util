@@ -29,16 +29,19 @@ type CopyManager struct {
 	mu           sync.Mutex
 	wg           sync.WaitGroup
 	startTime    time.Time
+	copyStarted  bool
+	scanStopped  chan struct{}
 }
 
 // NewCopyManager creates a new copy manager
 func NewCopyManager(sourceDir, targetDir string) *CopyManager {
 	return &CopyManager{
-		scanner:   scanner.NewScanner(),
-		copier:    tuneCopierForSystem(sourceDir, targetDir),
-		sourceDir: sourceDir,
-		targetDir: targetDir,
-		startTime: time.Now(),
+		scanner:     scanner.NewScanner(),
+		copier:      tuneCopierForSystem(sourceDir, targetDir),
+		sourceDir:   sourceDir,
+		targetDir:   targetDir,
+		startTime:   time.Now(),
+		scanStopped: make(chan struct{}),
 	}
 }
 
@@ -73,24 +76,37 @@ func (cm *CopyManager) monitorScanProgress() {
 	for progress := range cm.scanner.Progress() {
 		cm.mu.Lock()
 		cm.scanProgress = progress
+		cs := cm.copyStarted
 		cm.mu.Unlock()
 
-		// GUI 업데이트를 위한 콜백 호출 가능
+		if cs {
+			// 복사 시작 후에는 스캔 로그 고루틴을 즉시 종료하여 잔여 "스캔 중" 출력 방지
+			break
+		}
 		cm.onScanProgress(progress)
+	}
+	// 스캔 모니터 종료 신호
+	select {
+	case <-cm.scanStopped:
+		// already closed
+	default:
+		close(cm.scanStopped)
 	}
 }
 
 // monitorCopyProgress monitors copy progress
 func (cm *CopyManager) monitorCopyProgress() {
 	defer cm.wg.Done()
-	lastUpdate := time.Now()
+	// 첫 메시지는 즉시 출력되도록 0값으로 시작
+	var lastUpdate time.Time
+	// debug prints removed
 	for progress := range cm.copier.Progress() {
 		cm.mu.Lock()
 		cm.copyProgress = progress
 		cm.mu.Unlock()
 
-		// 1초마다 업데이트
-		if time.Since(lastUpdate) >= time.Second {
+		// 첫 메시지 즉시 + 이후 1초 주기로 업데이트
+		if lastUpdate.IsZero() || time.Since(lastUpdate) >= time.Second {
 			cm.onCopyProgress(progress)
 			lastUpdate = time.Now()
 		}
@@ -128,6 +144,26 @@ func (cm *CopyManager) copyFiles() {
 	// 총 파일 수와 크기를 copier에 설정
 	cm.copier.SetTotal(int64(len(files)), totalSize)
 
+	// 복사 시작 플래그 설정(스캔 로그 중단)
+	cm.mu.Lock()
+	cm.copyStarted = true
+	cm.mu.Unlock()
+
+	// 스캔 모니터 종료를 기다린 뒤 스캔 완료 메시지 출력
+	select {
+	case <-cm.scanStopped:
+	case <-time.After(200 * time.Millisecond):
+	}
+	fmt.Printf("\n스캔 완료: %d개 파일 수집. 복사 시작...\n", len(files))
+
+	// 초기 복사 진행 한 줄(스캔 완료 메시지 뒤에 출력)
+	if len(files) > 0 {
+		// 스캔 진행 고루틴이 종료될 시간 아주 짧게 확보
+		time.Sleep(300 * time.Millisecond)
+		fmt.Println()
+		fmt.Printf("\r복사 중: 0/%d개 파일, 0.0%% 완료 (경과: 0초, 남은시간: 0초, 속도: 0.0 파일/초)", len(files))
+	}
+
 	// 병렬 복사 시작
 	cm.copier.CopyFilesParallel(files)
 
@@ -142,6 +178,13 @@ func (cm *CopyManager) copyFiles() {
 // onScanProgress is called when scan progress updates
 func (cm *CopyManager) onScanProgress(progress scanner.Progress) {
 	elapsedSeconds := int(progress.ElapsedTime.Seconds())
+	if os.Getenv("SUPERFAST_DEBUG") == "1" {
+		fmt.Printf("\n스캔 중: %d개 파일 (경과: %d초, 속도: %.1f 파일/초)",
+			progress.TotalFiles,
+			elapsedSeconds,
+			progress.Speed)
+		return
+	}
 	fmt.Printf("\r스캔 중: %d개 파일 (경과: %d초, 속도: %.1f 파일/초)",
 		progress.TotalFiles,
 		elapsedSeconds,
@@ -158,6 +201,16 @@ func (cm *CopyManager) onCopyProgress(progress copier.CopyProgress) {
 	elapsedSeconds := int(progress.ElapsedTime.Seconds())
 	remainingSeconds := int(progress.RemainingTime.Seconds())
 
+	if os.Getenv("SUPERFAST_DEBUG") == "1" {
+		fmt.Printf("\n복사 중: %d/%d개 파일, %.1f%% 완료 (경과: %d초, 남은시간: %d초, 속도: %.1f 파일/초)",
+			progress.CompletedFiles,
+			progress.TotalFiles,
+			percent,
+			elapsedSeconds,
+			remainingSeconds,
+			progress.Speed)
+		return
+	}
 	fmt.Printf("\r복사 중: %d/%d개 파일, %.1f%% 완료 (경과: %d초, 남은시간: %d초, 속도: %.1f 파일/초)",
 		progress.CompletedFiles,
 		progress.TotalFiles,

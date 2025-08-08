@@ -96,6 +96,8 @@ func (s *Scanner) ScanDirectory(path string) {
 		workerCount := s.concurrency
 		var workers sync.WaitGroup
 		workers.Add(workerCount)
+		// 명시적 크기 수집 옵션: 기본 false (스캔 가속)
+		collectSize := getEnvBool("SCANNER_COLLECT_SIZE", false)
 		for i := 0; i < workerCount; i++ {
 			go func() {
 				defer workers.Done()
@@ -126,27 +128,26 @@ func (s *Scanner) ScanDirectory(path string) {
 							dirCh <- entryPath
 							continue
 						}
-
-						// 파일/심볼릭링크 info (Lstat 사용으로 링크 미추적)
-						info, err := os.Lstat(entryPath)
-						if err != nil {
-							select {
-							case s.errCh <- err:
-							default:
+						// 파일 처리 (필요 시에만 크기 조회)
+						var size int64
+						if collectSize {
+							info, err := os.Lstat(entryPath)
+							if err != nil {
+								select {
+								case s.errCh <- err:
+								default:
+								}
+								continue
 							}
-							continue
+							size = info.Size()
 						}
-
-						// 파일 처리
-						fileInfo := FileInfo{
-							Path: entryPath,
-							Size: info.Size(),
-							Dir:  dir,
-						}
+						fileInfo := FileInfo{Path: entryPath, Size: size, Dir: dir}
 
 						// 진행 상태 O(1) 누적 (atomic)
 						atomic.AddInt64(&s.totalFiles, 1)
-						atomic.AddInt64(&s.totalSize, fileInfo.Size)
+						if collectSize {
+							atomic.AddInt64(&s.totalSize, fileInfo.Size)
+						}
 
 						// 파일 정보 전송
 						if atomic.LoadInt32(&s.canceled) == 0 {
@@ -245,6 +246,19 @@ func getEnvInt(key string, def int) int {
 	if v, ok := os.LookupEnv(key); ok {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
+		}
+	}
+	return def
+}
+
+// getEnvBool returns boolean environment variable or default if not present/invalid
+func getEnvBool(key string, def bool) bool {
+	if v, ok := os.LookupEnv(key); ok {
+		switch v {
+		case "1", "true", "TRUE", "True", "yes", "Y", "y":
+			return true
+		case "0", "false", "FALSE", "False", "no", "N", "n":
+			return false
 		}
 	}
 	return def

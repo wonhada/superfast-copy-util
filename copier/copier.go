@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -92,26 +93,25 @@ func (c *Copier) CopyFilesParallel(files []string) {
 		if len(files) == 0 {
 			return
 		}
-
-		// 비어있는 폴더 포함 모든 디렉터리 미리 생성
+		// 비어있는 폴더 포함 모든 디렉터리 미리 생성 (항상 실행)
 		c.ensureAllDirectories()
 
-		// 총 파일 수와 크기 계산
-		var totalSize int64
-		for _, file := range files {
-			if info, err := os.Stat(file); err == nil {
-				totalSize += info.Size()
-			}
-		}
-
+		// 총 파일 사전 합산(크기)은 건너뛰고 즉시 복사 시작
 		c.progressMux.Lock()
 		c.progress.TotalFiles = int64(len(files))
-		c.progress.TotalSize = totalSize
+		c.progress.TotalSize = 0
 		c.progressMux.Unlock()
+		// debug removed
 
-		// 파일 채널 생성
-		fileChan := make(chan string, len(files))
+		// 파일 채널 생성: 과도한 버퍼 사용을 피하기 위해 상한 적용
+		bufCap := len(files)
+		if bufCap > 8192 {
+			bufCap = 8192
+		}
+		fileChan := make(chan string, bufCap)
 		var wg sync.WaitGroup
+
+		// debug removed
 
 		// 워커들 시작
 		for i := 0; i < c.workerCount; i++ {
@@ -119,9 +119,21 @@ func (c *Copier) CopyFilesParallel(files []string) {
 			go c.copyWorker(fileChan, &wg)
 		}
 
+		// debug removed
+
 		// 진행 상황 모니터링
 		done := make(chan bool)
 		go c.monitorProgress(done)
+		// 초기 진행 상태를 즉시 1회 전송하여 "복사 중" 첫 줄이 곧바로 표시되도록 함
+		func() {
+			c.progressMux.Lock()
+			p := c.progress
+			c.progressMux.Unlock()
+			select {
+			case c.progressCh <- p:
+			default:
+			}
+		}()
 
 		// 파일들을 채널에 전송
 		for _, file := range files {
@@ -146,7 +158,6 @@ func (c *Copier) ensureAllDirectories() {
 	if err != nil || !srcInfo.IsDir() {
 		return
 	}
-
 	// 루트도 포함해 순회하며 디렉터리만 생성
 	_ = filepath.WalkDir(c.sourceDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -200,17 +211,25 @@ func (c *Copier) copyWorker(fileChan <-chan string, wg *sync.WaitGroup) {
 
 // copySingleFile copies a single file
 func (c *Copier) copySingleFile(srcPath string, buffer []byte) CopyResult {
-	// 상대 경로 계산
-	relPath, err := filepath.Rel(c.sourceDir, srcPath)
+	// 상대 경로 계산은 원본 경로로 수행(긴 경로 접두 제거)
+	origSrc := filepath.Clean(srcPath)
+	relPath, err := filepath.Rel(filepath.Clean(c.sourceDir), origSrc)
 	if err != nil {
-		return CopyResult{
-			FilePath: srcPath,
-			Success:  false,
-			Error:    fmt.Errorf("상대 경로 계산 실패: %v", err),
+		// Windows의 대소문자/경로 구분 문제에 대비한 폴백
+		if rp, ok := c.relPathFallback(origSrc); ok {
+			relPath = rp
+		} else {
+			return CopyResult{
+				FilePath: origSrc,
+				Success:  false,
+				Error:    fmt.Errorf("상대 경로 계산 실패: %v", err),
+			}
 		}
 	}
 
 	dstPath := filepath.Join(c.targetDir, relPath)
+	longSrc := normalizeLongPath(origSrc)
+	longDst := normalizeLongPath(dstPath)
 	dstDir := filepath.Dir(dstPath)
 
 	// 대상 디렉토리 생성
@@ -223,19 +242,19 @@ func (c *Copier) copySingleFile(srcPath string, buffer []byte) CopyResult {
 	}
 
 	// 파일 정보 가져오기
-	info, err := os.Stat(srcPath)
+	info, err := os.Stat(longSrc)
 	if err != nil {
 		return CopyResult{
-			FilePath: srcPath,
+			FilePath: origSrc,
 			Success:  false,
 			Error:    fmt.Errorf("파일 정보 읽기 실패: %v", err),
 		}
 	}
 
 	// 파일 복사
-	if err := c.copyFileContent(srcPath, dstPath, buffer); err != nil {
+	if err := c.copyFileContent(longSrc, longDst, buffer); err != nil {
 		return CopyResult{
-			FilePath: srcPath,
+			FilePath: origSrc,
 			Success:  false,
 			Error:    err,
 			Size:     info.Size(),
@@ -243,10 +262,51 @@ func (c *Copier) copySingleFile(srcPath string, buffer []byte) CopyResult {
 	}
 
 	return CopyResult{
-		FilePath: srcPath,
+		FilePath: origSrc,
 		Success:  true,
 		Size:     info.Size(),
 	}
+}
+
+// relPathFallback attempts to compute a relative path in a tolerant way on Windows
+func (c *Copier) relPathFallback(srcPath string) (string, bool) {
+	// Normalize separators
+	cleanSrc := filepath.Clean(srcPath)
+	cleanBase := filepath.Clean(c.sourceDir)
+	// Ensure trailing separator handling
+	withSep := cleanBase
+	if !strings.HasSuffix(withSep, string(os.PathSeparator)) {
+		withSep = withSep + string(os.PathSeparator)
+	}
+	if runtime.GOOS == "windows" {
+		// Case-insensitive prefix trim
+		if strings.EqualFold(cleanSrc, cleanBase) {
+			return ".", true
+		}
+		if len(cleanSrc) > len(withSep) && strings.EqualFold(cleanSrc[:len(withSep)], withSep) {
+			return cleanSrc[len(withSep):], true
+		}
+	}
+	// Fallback failed
+	return "", false
+}
+
+// WorkerCount returns current worker count (for diagnostics)
+func (c *Copier) WorkerCount() int { return c.workerCount }
+
+// normalizeLongPath converts a Windows path to long-path form when necessary
+func normalizeLongPath(p string) string {
+	if runtime.GOOS != "windows" {
+		return p
+	}
+	if strings.HasPrefix(p, `\\?\`) || strings.HasPrefix(p, `\\.\`) {
+		return p
+	}
+	// UNC path
+	if strings.HasPrefix(p, `\\`) {
+		return `\\?\UNC\` + strings.TrimPrefix(p, `\\`)
+	}
+	return `\\?\` + p
 }
 
 // copyFileContent copies the content of a file
